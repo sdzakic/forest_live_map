@@ -38,13 +38,14 @@ There is no prebuilt `.mod` file, so the mod is built from source once using Mod
 1. In ModAPI, open the **Development** tab, click **Create new project** and use `LiveMap` as the ID.
 2. Close ModAPI. It rewrites `ModInfo.xml` whenever it saves a project, so a copy made while it is open can be overwritten.
 3. Copy `LiveMapMod/LiveMap.cs` and `LiveMapMod/ModInfo.xml` into `<ModAPI>/projects/TheForest/LiveMap/`, replacing the generated `ModInfo.xml`.
-4. Open the `.sln` file from that folder in Visual Studio and add `LiveMap.cs` to the project if it is not listed.
+4. Open the `.sln` file from that folder in Visual Studio. Add `LiveMap.cs` to the project if it is not listed, and add a reference to `System` under **References**, because ModAPI's generated project leaves it out.
 5. Build the solution with Ctrl+Shift+B.
 6. Start ModAPI again, select the project and click **Create Mod** in the lower right corner. It should report that the mod was created.
 
 If you change the code and create the mod again, increase `Version` in `ModInfo.xml` or delete the old file from `<ModAPI>/mods/TheForest/`.
 
 Troubleshooting:
+ * If the build cannot find `TcpClient` or `Queue`, the `System` reference is missing. ModAPI can remove it when it regenerates the project, so add it again.
  * If the F7 key is missing, add an assignable key with the ID `Update` to the project in the Development tab.
  * If ModAPI says to create the Mod Library first, or the build cannot find the game's classes, create the Mod Library in the Development tab and reopen the project. The project's references to the game, including `bolt.dll` and `bolt.user.dll`, depend on it.
 
