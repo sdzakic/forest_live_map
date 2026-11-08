@@ -1,7 +1,7 @@
 import json
 import sys
+import time
 from enum import Enum
-from pprint import pprint
 
 import pygame
 from pygame.locals import *
@@ -12,6 +12,9 @@ from twisted.internet import reactor, protocol
 from twisted.protocols.basic import LineReceiver
 
 pygame.init()
+
+# TCP port the mod connects to (see LiveMapMod/LiveMap.cfg); override with the first command line argument
+LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
 
 # square window: 1000 x 1000
 WINDOW_SIZE = 1000
@@ -30,17 +33,27 @@ FPS = 30.0
 MAX_ZOOM_FACTOR = 5.0
 MIN_ZOOM_FACTOR = 0.75
 
-# how long a game object lives until it's removed from the map, if there are no updates from the server
-# GAME_OBJECT_TTL_SEC = 2.0
+# players and enemies are re-sent by the mod every second; if we haven't heard about one for this long
+# it left the game / despawned and is removed from the map. Static objects (caves, pickups) never expire.
+DYNAMIC_OBJECT_TTL_SEC = 5.0
 
 MARKER_SZE = 7.0
 ICON_SIZE = 64
+LABEL_FONT_SIZE = 13
+HUD_FONT_SIZE = 18
 ICONS = {}
+FONTS = {}
 
 TYPE_PLAYER = 0
 TYPE_ENEMY = 1
 TYPE_CAVE_ENTRANCE = 2
 TYPE_PICKUP = 3
+
+DYNAMIC_TYPES = (TYPE_PLAYER, TYPE_ENEMY)
+
+LOCAL_PLAYER_COLOR = 'green'
+# colors handed out to other players in the session, in order of appearance
+REMOTE_PLAYER_COLORS = ['cyan', 'yellow', 'magenta', 'orange', 'deepskyblue', 'violet', 'springgreen', 'gold']
 
 
 class Item(Enum):
@@ -78,17 +91,43 @@ def load_icons():
     ICONS[Item.DYNAMITE] = pygame.image.load("icons/dynamite_64.png")
 
 
+def get_font(size: int):
+    size = max(int(size), 8)
+    if size not in FONTS:
+        FONTS[size] = pygame.font.SysFont("arial", size, bold=True)
+    return FONTS[size]
+
+
 class GameProtocol(LineReceiver):
+    """One connection from one running copy of the mod.
+
+    Several mods may connect at once (e.g. every player in a co-op session points their mod at
+    the same viewer), so everything a connection sends is tagged with its connection id to keep
+    the Unity instance IDs of different game processes from colliding.
+    """
 
     delimiter = b"\n"
+    MAX_LENGTH = 1024 * 1024
+    next_conn_id = 1
 
     def connectionMade(self):
-        print("New incoming connection")
+        self.conn_id = GameProtocol.next_conn_id
+        GameProtocol.next_conn_id += 1
+        peer = self.transport.getPeer()
+        print(f"New incoming connection #{self.conn_id} from {peer.host}:{peer.port}")
+        game.connection_made(self.conn_id)
+
+    def connectionLost(self, reason=protocol.connectionDone):
+        print(f"Connection #{self.conn_id} closed")
+        game.connection_lost(self.conn_id)
 
     def lineReceived(self, line):
-        # print(line)
-        game_object = json.loads(line)
-        game.received_object(game_object)
+        try:
+            game_object = json.loads(line)
+        except ValueError as e:
+            print(f"Ignoring malformed line from connection #{self.conn_id}: {e}")
+            return
+        game.received_object(self.conn_id, game_object)
 
 
 class Game:
@@ -110,24 +149,26 @@ class Game:
         load_icons()
 
         # in-game coordinates of the point of view (map center)
-        # by default, it will follow the player
+        # by default, it will follow the local player
         self.point_of_view_wx = 0.0
         self.point_of_view_wy = 0.0
-        # self.point_of_view_wx = 350.0
-        # self.point_of_view_wy = 1300.0
 
-        # all game objects that are shown on the map (dict: instance ID -> json object)
+        # all game objects that are shown on the map (dict: (connection ID, instance ID) -> json object)
         self.game_objects = {}
-        # self.game_objects = {0: {"type": TYPE_PLAYER, "id": 0, "x": 350.0, "y": 1300.0, "rotZ": 110.0}}
-        # self.game_objects = {0: {"type": TYPE_ROPE_PICKUP, "id": 0, "x": 100.0, "y": 100.0, "rotZ": 110.0}}
+        # (connection ID, instance ID) -> time.time() of the last update, for players and enemies only
+        self.last_update_time = {}
 
-        # self.game_object_last_update_time = {}  # obj ID -> last update time in seconds (float)
+        # key of the player the map is centered on, or None to stay where we are
+        self.followed_key = None
+        # key -> color name, so a player keeps the same color for the whole session
+        self.player_colors = {}
 
-        # flag that tells whether the player is in the caves
+        # flag that tells whether the followed player is in the caves (selects the map image)
         self.is_in_caves = False
         self.is_running = True
         self.n_pickups = 0
         self.n_cave_entrances = 0
+        self.n_connections = 0
 
         self.looping_call = LoopingCall(self.loop)
         self.looping_call.start(1.0 / FPS)
@@ -135,7 +176,8 @@ class Game:
     # main loop method
     def loop(self):
         self.event_loop()
-        # self.evict_expired_game_objects()
+        self.evict_expired_game_objects()
+        self.update_point_of_view()
         self.draw()
 
     # process input events from mouse and keyboard
@@ -151,47 +193,125 @@ class Game:
                 self.zoom_factor -= event.y*0.1
                 self.zoom_factor = min(self.zoom_factor, MAX_ZOOM_FACTOR)
                 self.zoom_factor = max(self.zoom_factor, MIN_ZOOM_FACTOR)
-            # if event.type == KEYDOWN:
-            #     if event.key == pygame[K_ESCAPE]:
-            #         pygame.quit()
-            #         sys.exit()
+            if event.type == KEYDOWN:
+                if event.key == K_TAB:
+                    self.follow_next_player()
+                if event.key == K_SPACE:
+                    self.follow_local_player()
 
-    def remove_static_objects(self):
-        for gid, go in list(self.game_objects.items()):
-            if go['type'] == TYPE_CAVE_ENTRANCE or go['type'] == TYPE_PICKUP:
-                del self.game_objects[gid]
+    # ------------------------------------------------------------------ connections
+
+    def connection_made(self, conn_id: int):
+        self.n_connections += 1
+
+    def connection_lost(self, conn_id: int):
+        self.n_connections = max(0, self.n_connections - 1)
+        # everything that connection told us about is gone with it
+        for key in [k for k in self.game_objects if k[0] == conn_id]:
+            self.remove_object(key)
+
+    # ------------------------------------------------------------------ game objects
+
+    def remove_object(self, key):
+        self.game_objects.pop(key, None)
+        self.last_update_time.pop(key, None)
+        if self.followed_key == key:
+            self.followed_key = None
 
     def remove_enemies(self):
-        for gid, go in list(self.game_objects.items()):
+        for key, go in list(self.game_objects.items()):
             if go['type'] == TYPE_ENEMY:
-                del self.game_objects[gid]
+                self.remove_object(key)
 
-    def received_object(self, game_object):
+    def evict_expired_game_objects(self):
+        now = time.time()
+        for key, last in list(self.last_update_time.items()):
+            if now - last > DYNAMIC_OBJECT_TTL_SEC:
+                go = self.game_objects.get(key)
+                if go is not None and go['type'] == TYPE_PLAYER:
+                    print(f"Player left: {go.get('name', key)}")
+                self.remove_object(key)
+
+    def players(self):
+        return {k: go for k, go in self.game_objects.items() if go['type'] == TYPE_PLAYER}
+
+    def received_object(self, conn_id: int, game_object):
         if "actionType" in game_object:
-            # self.remove_static_objects()
             return
 
-        if game_object['type'] == TYPE_PLAYER and self.is_in_caves != game_object['inCave']:
-            # clear entries on entering or leaving a cave
-            self.remove_enemies()
+        key = (conn_id, game_object["id"])
+        game_object.setdefault('inCave', False)
+        game_object.setdefault('isLocal', False)
+        game_object.setdefault('name', '')
 
-        gid = game_object["id"]
-        self.game_objects[gid] = game_object
-        # self.game_object_last_update_time[gid] = time.time()
+        previous = self.game_objects.get(key)
+        self.game_objects[key] = game_object
 
-        # follow the player on the map
+        if game_object['type'] in DYNAMIC_TYPES:
+            self.last_update_time[key] = time.time()
+
         if game_object['type'] == TYPE_PLAYER:
-            self.point_of_view_wx = game_object['x']
-            self.point_of_view_wy = game_object['y']
-            self.is_in_caves = game_object['inCave']
+            if previous is None:
+                self.assign_player_color(key, game_object)
+                print(f"Player joined: {game_object['name']}" + (" (local)" if game_object['isLocal'] else ""))
+            # follow the first local player we hear about (ours), or whoever shows up first otherwise
+            if self.followed_key is None or (game_object['isLocal'] and not self.game_objects.get(self.followed_key, {}).get('isLocal')):
+                self.followed_key = key
         if game_object['type'] == TYPE_PICKUP:
             game_object['item'] = Item.parse(game_object['itemID'])
-            # pprint(game_object)
             self.n_pickups += 1
             print('Pickups: ' + str(self.n_pickups))
         if game_object['type'] == TYPE_CAVE_ENTRANCE:
             self.n_cave_entrances += 1
             print('Cave entrances: ' + str(self.n_cave_entrances))
+
+    def assign_player_color(self, key, game_object):
+        if game_object['isLocal']:
+            self.player_colors[key] = LOCAL_PLAYER_COLOR
+            return
+        used = set(self.player_colors.values())
+        for color in REMOTE_PLAYER_COLORS:
+            if color not in used:
+                self.player_colors[key] = color
+                return
+        self.player_colors[key] = REMOTE_PLAYER_COLORS[len(self.player_colors) % len(REMOTE_PLAYER_COLORS)]
+
+    def player_color(self, key, game_object):
+        if key not in self.player_colors:
+            self.assign_player_color(key, game_object)
+        return self.player_colors[key]
+
+    # ------------------------------------------------------------------ following
+
+    def follow_next_player(self):
+        keys = sorted(self.players().keys())
+        if not keys:
+            return
+        if self.followed_key in keys:
+            self.followed_key = keys[(keys.index(self.followed_key) + 1) % len(keys)]
+        else:
+            self.followed_key = keys[0]
+        print(f"Following: {self.game_objects[self.followed_key]['name']}")
+
+    def follow_local_player(self):
+        for key, go in self.players().items():
+            if go['isLocal']:
+                self.followed_key = key
+                print(f"Following: {go['name']}")
+                return
+
+    def update_point_of_view(self):
+        followed = self.game_objects.get(self.followed_key)
+        if followed is None:
+            return
+        self.point_of_view_wx = followed['x']
+        self.point_of_view_wy = followed['y']
+        if self.is_in_caves != followed['inCave']:
+            # the followed player entered or left a cave: switch map and drop the enemies of the other layer
+            self.is_in_caves = followed['inCave']
+            self.remove_enemies()
+
+    # ------------------------------------------------------------------ drawing
 
     def draw(self):
         if self.is_in_caves:
@@ -199,19 +319,29 @@ class Game:
         else:
             map_surface = self.bg_world_image.copy()
 
-        for game_object in list(self.game_objects.values()):
+        # players last so they are drawn on top of everything else
+        players = []
+        for key, game_object in list(self.game_objects.items()):
             if game_object['type'] == TYPE_PLAYER:
-                self.draw_marker(map_surface, game_object['x'], game_object['y'], 'green', True, game_object['rotZ'])
-                self.point_of_view_wx = game_object['x']
-                self.point_of_view_wy = game_object['y']
+                players.append((key, game_object))
             elif game_object['type'] == TYPE_ENEMY:
-                self.draw_marker(map_surface, game_object['x'], game_object['y'], 'red', False, game_object['rotZ'])
+                if game_object['inCave'] == self.is_in_caves:
+                    self.draw_marker(map_surface, game_object['x'], game_object['y'], 'red', False, game_object['rotZ'])
             elif game_object['type'] == TYPE_CAVE_ENTRANCE:
                 self.draw_marker_icon(map_surface, game_object['x'], game_object['y'], ICONS[TYPE_CAVE_ENTRANCE])
             elif "item" in game_object and game_object['item'] in ICONS:
                 self.draw_marker_icon(map_surface, game_object['x'], game_object['y'], ICONS[game_object['item']])
 
+        for key, game_object in players:
+            # only players on the same layer (overworld / caves) as the map we are showing
+            if game_object['inCave'] != self.is_in_caves:
+                continue
+            color = self.player_color(key, game_object)
+            self.draw_marker(map_surface, game_object['x'], game_object['y'], color, True, game_object['rotZ'])
+            self.draw_label(map_surface, game_object['x'], game_object['y'], game_object['name'], color)
+
         self.blit_map_surface(map_surface)
+        self.draw_hud(players)
         pygame.display.update()
 
     def draw_marker(self, map_surface, wx: float, wy: float, color: str, show_direction: bool, rot_z: float):
@@ -230,13 +360,51 @@ class Game:
             arrow_rx, arrow_ry = (mx + v.x, my + v.y)
             pygame.draw.line(map_surface, pygame.color.Color('white'), (arrow_cx, arrow_cy), (arrow_lx, arrow_ly), 2)
             pygame.draw.line(map_surface, pygame.color.Color('white'), (arrow_cx, arrow_cy), (arrow_rx, arrow_ry), 2)
-            pass
+
+    def draw_label(self, map_surface, wx: float, wy: float, text: str, color: str):
+        if not text:
+            return
+        mx, my = world_to_map_image(wx, wy)
+        # the map surface is scaled down by zoom_factor when blitted, so scale the text up to compensate
+        font = get_font(LABEL_FONT_SIZE * self.zoom_factor)
+        shadow = font.render(text, True, pygame.color.Color('black'))
+        label = font.render(text, True, pygame.color.Color(color))
+        x = mx - label.get_width() / 2
+        y = my + (MARKER_SZE + 3) * self.zoom_factor
+        offset = max(1, int(self.zoom_factor))
+        map_surface.blit(shadow, (x + offset, y + offset))
+        map_surface.blit(label, (x, y))
 
     def draw_marker_icon(self, map_surface, wx: float, wy: float, marker_image):
         mx, my = world_to_map_image(wx, wy)
         scaled_icon_size = ICON_SIZE * self.zoom_factor / 4
         marker_image = pygame.transform.smoothscale(marker_image, (int(scaled_icon_size), int(scaled_icon_size)))
         map_surface.blit(marker_image, (mx - scaled_icon_size/2, my - scaled_icon_size/2))
+
+    # list of players in the top left corner of the window, drawn directly on the screen (not scaled)
+    def draw_hud(self, players):
+        font = get_font(HUD_FONT_SIZE)
+        x, y = 10, 10
+        line_height = font.get_linesize() + 4
+
+        if self.n_connections == 0:
+            self.screen.blit(font.render(f"Waiting for the game mod on port {LISTEN_PORT}...", True, pygame.color.Color('white')), (x, y))
+            return
+
+        for key, go in sorted(players, key=lambda kv: (not kv[1]['isLocal'], kv[1]['name'])):
+            color = self.player_color(key, go)
+            text = go['name']
+            if key == self.followed_key:
+                text = "> " + text
+            if go['inCave'] != self.is_in_caves:
+                text += " (in caves)" if go['inCave'] else " (outside)"
+            pygame.draw.circle(self.screen, pygame.color.Color(color), (x + 8, y + line_height // 2), 6)
+            pygame.draw.circle(self.screen, pygame.color.Color('white'), (x + 8, y + line_height // 2), 7, width=1)
+            self.screen.blit(font.render(text, True, pygame.color.Color('white')), (x + 22, y))
+            y += line_height
+
+        if len(players) > 1:
+            self.screen.blit(font.render("TAB: follow next player   SPACE: follow yourself", True, pygame.color.Color('lightgray')), (x, y + 6))
 
     def blit_map_surface(self, map_surface):
         dst_size = (int(map_surface.get_rect().w / self.zoom_factor), int(map_surface.get_rect().h / self.zoom_factor))
@@ -257,5 +425,7 @@ game = Game()
 
 factory = protocol.Factory()
 factory.protocol = GameProtocol
-reactor.listenTCP(9999, factory)
+# listen on all interfaces so mods running on other PCs in the session can connect too
+reactor.listenTCP(LISTEN_PORT, factory, interface="0.0.0.0")
+print(f"Listening for the Live Map mod on port {LISTEN_PORT}")
 reactor.run()

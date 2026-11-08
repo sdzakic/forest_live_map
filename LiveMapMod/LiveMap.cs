@@ -1,6 +1,7 @@
-﻿using System;
+﻿﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -31,7 +32,26 @@ namespace LiveMap
 
         const float UPDATE_INTERVAL_SECONDS = 1f;
 
+        // how often the scene is re-scanned for enemies when running as a multiplayer client
+        // (clients don't get the host's cannibal lists, so we have to look for enemy components ourselves)
+        const float CLIENT_ENEMY_RESCAN_INTERVAL_SECONDS = 5f;
+
+        // a remote player this far below the terrain surface is assumed to be in the caves
+        const float CAVE_DEPTH_THRESHOLD = 8f;
+
+        // names of the AI components attached to networked enemies on multiplayer clients
+        // (resolved via reflection so the mod still compiles/runs if a game update renames them)
+        private static readonly string[] CLIENT_ENEMY_TYPE_NAMES = { "mutantAI_net", "mutantAI" };
+
+        const string DEFAULT_HOST = "127.0.0.1";
+        const int DEFAULT_PORT = 9999;
+        const string CONFIG_FILE_NAME = "LiveMap.cfg";
+
+        private string host = DEFAULT_HOST;
+        private int port = DEFAULT_PORT;
+
         private float lastUpdate = 0.0f;
+        private float lastClientEnemyScan = float.MaxValue;
 
         private TcpClient client;
 
@@ -39,12 +59,17 @@ namespace LiveMap
         private readonly object queueLock = new object();
         private bool isThreadStarted = false;
 
+        private List<Type> clientEnemyTypes = null;
+        private List<Component> clientEnemies = new List<Component>();
+
         void Awake()
         {
-            ModAPI.Log.Write("live map started: 11:35");
+            ModAPI.Log.Write("live map started (multiplayer build)");
+            LoadConfig();
             if (!isThreadStarted)
             {
                 var th = new Thread(TcpClientLoop);
+                th.IsBackground = true;
                 th.Start();
                 isThreadStarted = true;
                 ModAPI.Log.Write("Started TCP client thread");
@@ -65,55 +90,335 @@ namespace LiveMap
 
                 try
                 {
-                    if (LocalPlayer.Transform != null && LocalPlayer.Transform.position != null) 
-                    {
-                        AddObjectToQueue(new MapEntry(TYPE_PLAYER, LocalPlayer.GameObject.GetInstanceID(), -1, "player", LocalPlayer.Transform.position, LocalPlayer.Transform.rotation.eulerAngles, LocalPlayer.IsInCaves));
-                    }
+                    FindPlayers();
+                }
+                catch (Exception e)
+                {
+                    ModAPI.Log.Write("Error finding players: " + e);
+                }
 
+                try
+                {
                     FindCannibals();
                 }
                 catch (Exception e)
                 {
-                    ModAPI.Log.Write("Error: " + e);
+                    ModAPI.Log.Write("Error finding enemies: " + e);
                 }
             }
         }
 
+        // ---------------------------------------------------------------- config
+
+        // Reads <game folder>/LiveMap.cfg with "host=..." and "port=..." lines.
+        // Falls back to 127.0.0.1:9999 when the file is missing, so a friend can
+        // point their mod at the map viewer running on another machine.
+        private void LoadConfig()
+        {
+            try
+            {
+                string path = Path.Combine(Path.GetDirectoryName(Application.dataPath), CONFIG_FILE_NAME);
+                if (!File.Exists(path))
+                {
+                    ModAPI.Log.Write("No " + path + ", using default viewer address " + host + ":" + port);
+                    return;
+                }
+
+                foreach (string rawLine in File.ReadAllLines(path))
+                {
+                    string line = rawLine.Trim();
+                    if (line.Length == 0 || line.StartsWith("#"))
+                    {
+                        continue;
+                    }
+                    int eq = line.IndexOf('=');
+                    if (eq < 0)
+                    {
+                        continue;
+                    }
+                    string key = line.Substring(0, eq).Trim().ToLowerInvariant();
+                    string value = line.Substring(eq + 1).Trim();
+                    if (key == "host" && value.Length > 0)
+                    {
+                        host = value;
+                    }
+                    else if (key == "port")
+                    {
+                        int p;
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out p) && p > 0 && p < 65536)
+                        {
+                            port = p;
+                        }
+                    }
+                }
+                ModAPI.Log.Write("Viewer address from " + path + ": " + host + ":" + port);
+            }
+            catch (Exception e)
+            {
+                ModAPI.Log.Write("Error reading config, using defaults: " + e);
+            }
+        }
+
+        // ---------------------------------------------------------------- players
+
+        // Sends every player in the session (local and remote). In single player
+        // the list contains just the local player.
+        private void FindPlayers()
+        {
+            GameObject localGo = LocalPlayer.GameObject;
+            Transform localRoot = localGo != null ? localGo.transform.root : null;
+            bool sentLocal = false;
+            int index = 0;
+
+            if (Scene.SceneTracker != null && Scene.SceneTracker.allPlayers != null)
+            {
+                foreach (GameObject p in Scene.SceneTracker.allPlayers)
+                {
+                    index++;
+                    if (p == null)
+                    {
+                        continue;
+                    }
+
+                    bool isLocal = localGo != null && (p == localGo || (localRoot != null && p.transform.root == localRoot));
+                    if (isLocal && sentLocal)
+                    {
+                        continue; // the local player can show up more than once in the list
+                    }
+
+                    Vector3 position = p.transform.position;
+                    Vector3 rotation = p.transform.rotation.eulerAngles;
+                    bool inCave;
+                    if (isLocal)
+                    {
+                        if (LocalPlayer.Transform != null)
+                        {
+                            position = LocalPlayer.Transform.position;
+                            rotation = LocalPlayer.Transform.rotation.eulerAngles;
+                        }
+                        inCave = LocalPlayer.IsInCaves;
+                        sentLocal = true;
+                    }
+                    else
+                    {
+                        inCave = IsBelowTerrain(position);
+                    }
+
+                    string name = GetPlayerName(p, isLocal, index);
+                    AddObjectToQueue(new MapEntry(TYPE_PLAYER, p.GetInstanceID(), -1, name, position, rotation, inCave, isLocal));
+                }
+            }
+
+            if (!sentLocal && LocalPlayer.Transform != null && localGo != null)
+            {
+                AddObjectToQueue(new MapEntry(TYPE_PLAYER, localGo.GetInstanceID(), -1, GetPlayerName(localGo, true, 0),
+                    LocalPlayer.Transform.position, LocalPlayer.Transform.rotation.eulerAngles, LocalPlayer.IsInCaves, true));
+            }
+        }
+
+        private string GetPlayerName(GameObject player, bool isLocal, int index)
+        {
+            try
+            {
+                if (BoltNetwork.isRunning)
+                {
+                    BoltEntity entity = player.GetComponentInChildren<BoltEntity>();
+                    if (entity == null)
+                    {
+                        entity = player.GetComponentInParent<BoltEntity>();
+                    }
+                    if (entity != null && entity.isAttached)
+                    {
+                        IPlayerState state = entity.GetState<IPlayerState>();
+                        if (state != null && !string.IsNullOrEmpty(state.name))
+                        {
+                            return state.name;
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // fall through to a generic name
+            }
+            return isLocal ? "You" : "Player " + index;
+        }
+
+        // Rough test for "is this position inside a cave": caves are carved
+        // below the terrain surface, so anything well below it counts.
+        private bool IsBelowTerrain(Vector3 position)
+        {
+            try
+            {
+                Terrain terrain = Terrain.activeTerrain;
+                if (terrain == null)
+                {
+                    return false;
+                }
+                float surface = terrain.SampleHeight(position) + terrain.transform.position.y;
+                return position.y < surface - CAVE_DEPTH_THRESHOLD;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private bool IsMultiplayerClient()
+        {
+            try
+            {
+                return BoltNetwork.isRunning && BoltNetwork.isClient;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        // ---------------------------------------------------------------- enemies
+
         private void FindCannibals()
         {
-            if (Scene.MutantControler == null || Scene.MutantControler.ActiveWorldCannibals == null)
+            HashSet<int> cannibalIDs = new HashSet<int>();
+
+            // host / single player: the game keeps lists of the active cannibals
+            if (Scene.MutantControler != null)
+            {
+                if (LocalPlayer.IsInCaves)
+                {
+                    if (Scene.MutantControler.ActiveCaveCannibals != null)
+                    {
+                        foreach (var c in Scene.MutantControler.ActiveCaveCannibals)
+                        {
+                            AddEnemy(c, true, cannibalIDs);
+                        }
+                    }
+                }
+                else
+                {
+                    if (Scene.MutantControler.ActiveWorldCannibals != null)
+                    {
+                        foreach (var c in Scene.MutantControler.ActiveWorldCannibals)
+                        {
+                            AddEnemy(c, false, cannibalIDs);
+                        }
+                    }
+                }
+
+                if (Scene.MutantControler.activeInstantSpawnedCannibals != null)
+                {
+                    foreach (GameObject c in Scene.MutantControler.activeInstantSpawnedCannibals)
+                    {
+                        AddEnemy(c, LocalPlayer.IsInCaves, cannibalIDs);
+                    }
+                }
+            }
+
+            // multiplayer client: the lists above live on the host, so look for the
+            // networked enemy proxies in the scene instead
+            if (IsMultiplayerClient())
+            {
+                FindClientCannibals(cannibalIDs);
+            }
+        }
+
+        private void AddEnemy(GameObject c, bool inCave, HashSet<int> cannibalIDs)
+        {
+            if (c == null || !c.activeInHierarchy)
+            {
+                return;
+            }
+            if (cannibalIDs.Add(c.GetInstanceID()))
+            {
+                AddObjectToQueue(new MapEntry(TYPE_ENEMY, c, inCave));
+            }
+        }
+
+        private void FindClientCannibals(HashSet<int> cannibalIDs)
+        {
+            if (clientEnemyTypes == null)
+            {
+                ResolveClientEnemyTypes();
+            }
+            if (clientEnemyTypes.Count == 0)
             {
                 return;
             }
 
-            HashSet<int> cannibalIDs = new HashSet<int>();
-
-            if (LocalPlayer.IsInCaves)
+            lastClientEnemyScan += UPDATE_INTERVAL_SECONDS;
+            if (lastClientEnemyScan > CLIENT_ENEMY_RESCAN_INTERVAL_SECONDS)
             {
-                foreach (var c in Scene.MutantControler.ActiveCaveCannibals)
+                lastClientEnemyScan = 0f;
+                clientEnemies.Clear();
+                foreach (Type t in clientEnemyTypes)
                 {
-                    AddObjectToQueue(new MapEntry(TYPE_ENEMY, c));
-                    cannibalIDs.Add(c.GetInstanceID());
+                    UnityEngine.Object[] found = UnityEngine.Object.FindObjectsOfType(t);
+                    if (found == null)
+                    {
+                        continue;
+                    }
+                    foreach (UnityEngine.Object o in found)
+                    {
+                        Component comp = o as Component;
+                        if (comp != null)
+                        {
+                            clientEnemies.Add(comp);
+                        }
+                    }
                 }
             }
-            else
-            {
-                foreach (var c in Scene.MutantControler.ActiveWorldCannibals)
-                {
-                    AddObjectToQueue(new MapEntry(TYPE_ENEMY, c));
-                    cannibalIDs.Add(c.GetInstanceID());
-                }
-            }
 
-            foreach (GameObject c in Scene.MutantControler.activeInstantSpawnedCannibals)
+            foreach (Component comp in clientEnemies)
             {
-                if (!cannibalIDs.Contains(c.GetInstanceID()))
+                if (comp == null) // destroyed since the last scan
                 {
-                    AddObjectToQueue(new MapEntry(TYPE_ENEMY, c));
-                    cannibalIDs.Add(c.GetInstanceID());
+                    continue;
+                }
+                GameObject go = comp.gameObject;
+                AddEnemy(go, IsBelowTerrain(go.transform.position), cannibalIDs);
+            }
+        }
+
+        private void ResolveClientEnemyTypes()
+        {
+            clientEnemyTypes = new List<Type>();
+            foreach (string typeName in CLIENT_ENEMY_TYPE_NAMES)
+            {
+                Type t = FindType(typeName);
+                if (t != null)
+                {
+                    clientEnemyTypes.Add(t);
+                    ModAPI.Log.Write("Client enemy type: " + t.FullName);
+                }
+                else
+                {
+                    ModAPI.Log.Write("Client enemy type not found: " + typeName);
                 }
             }
         }
+
+        private static Type FindType(string name)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    Type t = asm.GetType(name);
+                    if (t != null)
+                    {
+                        return t;
+                    }
+                }
+                catch (Exception)
+                {
+                    // some dynamic assemblies refuse type lookups
+                }
+            }
+            return null;
+        }
+
+        // ---------------------------------------------------------------- static objects
 
         private void FindStaticObjects()
         {
@@ -172,29 +477,13 @@ namespace LiveMap
             if (objectsOfType.NullOrEmpty())
                 return;
 
-            // StringComparison comparisonType = StringComparison.InvariantCultureIgnoreCase;
-            // CultureInfo culture = CultureInfo.InvariantCulture;
-
             foreach (GameObject gameObject in objectsOfType)
             {
-                // if (!((UnityEngine.Object)gameObject == (UnityEngine.Object)null) && !gameObject.name.NullOrEmpty() && gameObject.name.Equals(name, comparisonType))
-                // if (!((UnityEngine.Object)gameObject == (UnityEngine.Object)null) && !gameObject.name.NullOrEmpty() && culture.CompareInfo.IndexOf(gameObject.name, itemName, CompareOptions.IgnoreCase) >= 0)
                 if (ContainsComponent(gameObject, typeof(PickUp)))
                 {
-                    // ModAPI.Log.Write("Found: " + gameObject.name + ", " + gameObject.GetInstanceID() + ", " + gameObject.transform.position);
                     entries.Add(new MapEntry(entryType, gameObject));
-                    //DumpGameObject(gameObject);
                 }
             }
-
-            //int itemId = 54; // rope
-            //Item item = ItemDatabase.ItemById(itemId);
-            //if (item != null)
-            //{
-            //    ModAPI.Log.Write("Found item: " + item._name);
-            //    GameObject itemGO = item._pickupPrefab.gameObject;
-            //    // DumpGameObject(itemGO);
-            //}
         }
 
         private void FindSpawnPools()
@@ -211,7 +500,6 @@ namespace LiveMap
                 if (!((UnityEngine.Object)obj == (UnityEngine.Object)null) && !obj.name.NullOrEmpty() && culture.CompareInfo.IndexOf(gameObject.name, itemName, CompareOptions.IgnoreCase) >= 0)
                 {
                     ModAPI.Log.Write("Found SpawnItemFromPool: " + obj.name + ", " + obj.GetInstanceID() + ", " + obj.transform.position + ", " + obj);
-                    // entries.Add(new MapEntry(entryType, gameObject));
                     DumpGameObject(obj.transform.gameObject);
                 }
             }
@@ -283,6 +571,8 @@ namespace LiveMap
             }
         }
 
+        // ---------------------------------------------------------------- networking
+
         private void AddObjectToQueue(System.Object obj)
         {
             lock (queueLock)
@@ -293,31 +583,39 @@ namespace LiveMap
 
         private void TcpClientLoop()
         {
-            try
+            while (true)
             {
-                while (true)
+                System.Object obj = null;
+                lock (queueLock)
                 {
-                    System.Object obj = null;
-                    lock (queueLock)
+                    if (queue.Count > 0)
                     {
-                        if (queue.Count > 0)
-                        {
-                            obj = queue.Dequeue();
-                        }
+                        obj = queue.Dequeue();
                     }
+                }
 
-                    if (obj == null)
-                    {
-                        Thread.Sleep(50);
-                        continue;
-                    }
+                if (obj == null)
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
 
+                try
+                {
                     SendAsJson(obj);
                 }
-            }
-            catch (Exception e)
-            {
-                ModAPI.Log.Write("Error: " + e);
+                catch (Exception e)
+                {
+                    // viewer not running or unreachable: drop what we have queued so far
+                    // (it would be stale by the time we reconnect) and try again later
+                    ModAPI.Log.Write("Cannot send to viewer at " + host + ":" + port + " (" + e.Message + "), retrying in 5 seconds");
+                    CloseClient();
+                    lock (queueLock)
+                    {
+                        queue.Clear();
+                    }
+                    Thread.Sleep(5000);
+                }
             }
         }
 
@@ -328,11 +626,7 @@ namespace LiveMap
             Byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
             TcpClient client = GetTcpClient();
             NetworkStream stream = client.GetStream();
-            // using (NetworkStream stream = client.GetStream())
-            // {
             stream.Write(jsonBytes, 0, jsonBytes.Length);
-            // }
-            // ModAPI.Log.Write("Sent: " + json);
         }
 
         private TcpClient GetTcpClient()
@@ -341,14 +635,26 @@ namespace LiveMap
             {
                 return client;
             }
+            CloseClient();
+
+            client = new TcpClient(host, port);
+            ModAPI.Log.Write("Connected to " + host + ":" + port);
+            return client;
+        }
+
+        private void CloseClient()
+        {
             if (client != null)
             {
-                client.Close();
+                try
+                {
+                    client.Close();
+                }
+                catch (Exception)
+                {
+                }
+                client = null;
             }
-
-            client = new TcpClient("127.0.0.1", 9999);
-            ModAPI.Log.Write("Connected to 127.0.0.1:9999");
-            return client;
         }
 
     }
@@ -365,12 +671,13 @@ namespace LiveMap
         public float z;
         public float rotZ;
         public bool inCave;
+        public bool isLocal;
 
-        public MapEntry(int type, GameObject gameObject) : 
-            this(type, gameObject.GetInstanceID(), GetItemID(gameObject), gameObject.name, gameObject.transform.position, gameObject.transform.rotation.eulerAngles, false)
+        public MapEntry(int type, GameObject gameObject, bool inCave = false) :
+            this(type, gameObject.GetInstanceID(), GetItemID(gameObject), gameObject.name, gameObject.transform.position, gameObject.transform.rotation.eulerAngles, inCave, false)
         { }
 
-        public MapEntry(int type, int id, int itemID, string name, Vector3 position, Vector3? rotation = null, bool? inCave = false)
+        public MapEntry(int type, int id, int itemID, string name, Vector3 position, Vector3? rotation = null, bool? inCave = false, bool isLocal = false)
         {
             this.type = type;
             this.id = id;
@@ -381,6 +688,7 @@ namespace LiveMap
             this.z = position.y; // z => y
             this.rotZ = rotation != null ? rotation.Value.y : 0; // y is z
             this.inCave = inCave != null && inCave.Value;
+            this.isLocal = isLocal;
         }
 
         private static int GetItemID(GameObject gameObject)
