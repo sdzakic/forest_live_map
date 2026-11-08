@@ -264,6 +264,18 @@ namespace LiveMap
             }
         }
 
+        private bool IsMultiplayer()
+        {
+            try
+            {
+                return BoltNetwork.isRunning;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
         private bool IsMultiplayerClient()
         {
             try
@@ -282,35 +294,36 @@ namespace LiveMap
         {
             HashSet<int> cannibalIDs = new HashSet<int>();
 
-            // host / single player: the game keeps lists of the active cannibals
+            // host / single player: the game keeps lists of the active cannibals.
+            // Both lists are always sent because in co-op the host can be on the surface
+            // while another player is in a cave; the viewer filters by the map layer it shows.
             if (Scene.MutantControler != null)
             {
-                if (LocalPlayer.IsInCaves)
+                if (Scene.MutantControler.ActiveCaveCannibals != null)
                 {
-                    if (Scene.MutantControler.ActiveCaveCannibals != null)
+                    foreach (var c in Scene.MutantControler.ActiveCaveCannibals)
                     {
-                        foreach (var c in Scene.MutantControler.ActiveCaveCannibals)
-                        {
-                            AddEnemy(c, true, cannibalIDs);
-                        }
+                        AddEnemy(c, true, cannibalIDs);
                     }
                 }
-                else
+
+                if (Scene.MutantControler.ActiveWorldCannibals != null)
                 {
-                    if (Scene.MutantControler.ActiveWorldCannibals != null)
+                    foreach (var c in Scene.MutantControler.ActiveWorldCannibals)
                     {
-                        foreach (var c in Scene.MutantControler.ActiveWorldCannibals)
-                        {
-                            AddEnemy(c, false, cannibalIDs);
-                        }
+                        AddEnemy(c, false, cannibalIDs);
                     }
                 }
 
                 if (Scene.MutantControler.activeInstantSpawnedCannibals != null)
                 {
+                    bool multiplayer = IsMultiplayer();
                     foreach (GameObject c in Scene.MutantControler.activeInstantSpawnedCannibals)
                     {
-                        AddEnemy(c, LocalPlayer.IsInCaves, cannibalIDs);
+                        if (c != null)
+                        {
+                            AddEnemy(c, multiplayer ? IsBelowTerrain(c.transform.position) : LocalPlayer.IsInCaves, cannibalIDs);
+                        }
                     }
                 }
             }
